@@ -14,21 +14,24 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder
 # =========================
 TOKEN = "8161107014:AAGBWEYVxie7-pB4-2FoGCPjCv_sl0yHogc"
 ADMIN_IDS = {5815294733}
-DB_PATH = "casino_clean.db"
+DB_PATH = "bot.db"
 
-# TOPUP/WITHDRAW (so'rov + admin tasdiq)
+# Kartalar (ko'rsatish uchun)
+PAYMENT_CARDS = {
+    "humo":   {"title": "🟦 HUMO",   "card": "9860 XXXX XXXX XXXX", "name": "H. (Ism)"},
+    "uzcard": {"title": "🟩 UZCARD", "card": "8600 XXXX XXXX XXXX", "name": "H. (Ism)"},
+}
+
 MIN_TOPUP = 20000
 MAX_TOPUP = 2000000
-TOPUP_CREDIT_RATE = 0.90  # 50k -> 45k real (10% fee demo)
-
-# BONUS
+TOPUP_TIMEOUT_MIN = 10  # 10 daqiqa ichida chek kelmasa expired
 DAILY_BONUS_AMOUNT = 3000
 
-# MINES
+# Mines
 MINES_SIZE = 5
 MINES_BOMBS = 3
 
-# AVIATOR
+# Aviator
 AVIATOR_TICK_SEC = 0.8
 AVIATOR_GROWTH = 0.05
 
@@ -63,32 +66,32 @@ CREATE TABLE IF NOT EXISTS promo_uses(
   PRIMARY KEY(user_id, code)
 );
 
+-- TOPUP: summa -> method -> "to'lov qildim" -> receipt photo -> admin approve/reject
 CREATE TABLE IF NOT EXISTS topup_requests(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
   amount INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
+  method TEXT NOT NULL DEFAULT '',
+  receipt_file_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'waiting_method',  -- waiting_method, waiting_receipt, waiting_admin, approved, rejected, expired, cancelled
   created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
   handled_by INTEGER,
   handled_at INTEGER
 );
 
+-- WITHDRAW: summa -> method -> card_number -> admin approve/reject
 CREATE TABLE IF NOT EXISTS withdraw_requests(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
   amount INTEGER NOT NULL,
-  note TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
+  method TEXT NOT NULL DEFAULT '',
+  card_number TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected, cancelled
   created_at INTEGER NOT NULL,
   handled_by INTEGER,
   handled_at INTEGER
 );
-
-CREATE TABLE IF NOT EXISTS house_profit(
-  id INTEGER PRIMARY KEY CHECK(id=1),
-  profit INTEGER NOT NULL DEFAULT 0
-);
-INSERT OR IGNORE INTO house_profit(id, profit) VALUES(1, 0);
 """
 
 async def db_init():
@@ -98,6 +101,10 @@ async def db_init():
 
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
+
+def parse_int_like(s: str) -> Optional[int]:
+    s = (s or "").replace(" ", "").strip()
+    return int(s) if s.isdigit() else None
 
 async def ensure_user(uid: int, ref_by: Optional[int] = None):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -161,20 +168,8 @@ async def set_last_daily(uid: int, ts: int):
         await db.execute("UPDATE users SET last_daily_at=? WHERE user_id=?", (ts, uid))
         await db.commit()
 
-async def add_house_profit(amount: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE house_profit SET profit=profit+? WHERE id=1", (amount,))
-        await db.commit()
-
 # =========================
-# HELPERS
-# =========================
-def parse_int_like(s: str) -> Optional[int]:
-    s = (s or "").replace(" ", "").strip()
-    return int(s) if s.isdigit() else None
-
-# =========================
-# REPLY MENU (pastda turadi)
+# REPLY MENU (PASTDA)
 # =========================
 def menu_kb(uid: int) -> types.ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
@@ -229,36 +224,81 @@ def admin_panel_kb(uid: int) -> types.ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
     kb.button(text="📥 Topup pending")
     kb.button(text="📤 Withdraw pending")
-    kb.button(text="📊 Profit")
     kb.button(text="🔙 Menyu")
-    kb.adjust(2, 1, 1)
+    kb.adjust(2, 1)
     return kb.as_markup(resize_keyboard=True)
 
 # =========================
-# MINES (inline 5x5)
+# INLINE: TOPUP UI
+# =========================
+def kb_pay_methods(amount: int) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="🟦 HUMO", callback_data=f"pay:method:humo:{amount}"),
+            types.InlineKeyboardButton(text="🟩 UZCARD", callback_data=f"pay:method:uzcard:{amount}"),
+        ],
+        [types.InlineKeyboardButton(text="❌ Bekor", callback_data="pay:cancel")]
+    ])
+
+def kb_paid_btn(topup_id: int) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="✅ To‘lov qildim", callback_data=f"pay:paid:{topup_id}")],
+        [types.InlineKeyboardButton(text="❌ Bekor", callback_data="pay:cancel")]
+    ])
+
+def kb_admin_topup(rid: int) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="✅ Tasdiq", callback_data=f"top:ok:{rid}"),
+            types.InlineKeyboardButton(text="❌ Rad", callback_data=f"top:no:{rid}"),
+        ]
+    ])
+
+# =========================
+# INLINE: WITHDRAW UI
+# =========================
+def kb_wd_methods(amount: int) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="🟦 HUMO", callback_data=f"wd:method:humo:{amount}"),
+            types.InlineKeyboardButton(text="🟩 UZCARD", callback_data=f"wd:method:uzcard:{amount}"),
+        ],
+        [types.InlineKeyboardButton(text="❌ Bekor", callback_data="wd:cancel")]
+    ])
+
+def kb_admin_withdraw(rid: int) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="✅ Tasdiq", callback_data=f"wda:ok:{rid}"),
+            types.InlineKeyboardButton(text="❌ Rad", callback_data=f"wda:no:{rid}"),
+        ]
+    ])
+
+# =========================
+# MINES
 # =========================
 @dataclass
 class MinesSession:
     bet: int
-    wallet: str  # "real" or "bonus"
+    wallet: str
     bombs: Set[int]
     opened: Set[int]
     active: bool = True
 
 mines_sessions: Dict[int, MinesSession] = {}
 
-def mines_multiplier(opened: int) -> float:
-    # pastroq koef (sekin o‘sadi)
-    table = [1.00, 1.06, 1.12, 1.20, 1.30, 1.45, 1.60, 1.80, 2.05, 2.35, 2.70]
-    if opened < len(table):
-        return table[opened]
-    return round(table[-1] + (opened - (len(table) - 1)) * 0.35, 2)
-
 def gen_bombs(exclude: int) -> Set[int]:
     cells = list(range(MINES_SIZE * MINES_SIZE))
     if exclude in cells:
         cells.remove(exclude)
     return set(random.sample(cells, MINES_BOMBS))
+
+def mines_multiplier(opened: int) -> float:
+    # o'sishi sekinroq
+    table = [1.00, 1.06, 1.12, 1.20, 1.30, 1.45, 1.60, 1.80, 2.05, 2.35, 2.70]
+    if opened < len(table):
+        return table[opened]
+    return round(table[-1] + (opened - (len(table) - 1)) * 0.30, 2)
 
 def kb_mines_grid(opened: Set[int], bombs: Optional[Set[int]] = None) -> types.InlineKeyboardMarkup:
     rows = []
@@ -281,7 +321,7 @@ def kb_mines_grid(opened: Set[int], bombs: Optional[Set[int]] = None) -> types.I
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 # =========================
-# AVIATOR (anim edit)
+# AVIATOR
 # =========================
 @dataclass
 class AviatorSession:
@@ -323,7 +363,8 @@ async def aviator_loop(bot: Bot, uid: int):
         s.frame += 1
         s.mult = round(s.mult * (1.0 + AVIATOR_GROWTH), 2)
 
-        crash_prob = min(0.02 + (s.mult - 1.0) * 0.015, 0.45)
+        # oddiy crash ehtimoli (ko'p to'lamasligi uchun)
+        crash_prob = min(0.03 + (s.mult - 1.0) * 0.020, 0.55)
         if random.random() < crash_prob:
             s.crashed = True
             aviator_sessions[uid] = s
@@ -331,8 +372,7 @@ async def aviator_loop(bot: Bot, uid: int):
                 await bot.edit_message_text(
                     chat_id=uid,
                     message_id=s.msg_id,
-                    text=render_plane(s.mult, s.frame, s.bet, s.wallet)
-                         + f"\n\n💥 CRASH! x{s.mult:.2f}\n😅 Keyingi safar omad!",
+                    text=render_plane(s.mult, s.frame, s.bet, s.wallet) + f"\n\n💥 CRASH! x{s.mult:.2f}\n😅 Keyingi safar omad!",
                     reply_markup=None
                 )
             except:
@@ -351,24 +391,7 @@ async def aviator_loop(bot: Bot, uid: int):
             pass
 
 # =========================
-# ADMIN inline approve/reject
-# =========================
-def kb_admin_req(prefix: str, rid: int) -> types.InlineKeyboardMarkup:
-    return types.InlineKeyboardMarkup(inline_keyboard=[
-        [
-            types.InlineKeyboardButton(text="✅ Tasdiq", callback_data=f"{prefix}:ok:{rid}"),
-            types.InlineKeyboardButton(text="❌ Rad", callback_data=f"{prefix}:no:{rid}"),
-        ]
-    ])
-
-# =========================
 # STATES
-# mode:
-#   mn_bet / mn_bet_custom
-#   av_bet / av_bet_custom
-#   topup_choose / topup_custom
-#   promo_enter
-#   wd_amount / wd_note
 # =========================
 steps: Dict[int, Dict[str, str]] = {}
 
@@ -385,23 +408,20 @@ async def start(m: types.Message):
 
 @dp.message(F.text == "🔙 Menyu")
 async def menu_back(m: types.Message):
-    uid = m.from_user.id
-    steps.pop(uid, None)
-    await m.answer("Menyu 👇", reply_markup=menu_kb(uid))
+    steps.pop(m.from_user.id, None)
+    await m.answer("Menyu 👇", reply_markup=menu_kb(m.from_user.id))
 
 @dp.message(F.text == "❌ Bekor qilish")
 async def cancel(m: types.Message):
-    uid = m.from_user.id
-    steps.pop(uid, None)
-    await m.answer("Bekor qilindi.", reply_markup=menu_kb(uid))
+    steps.pop(m.from_user.id, None)
+    await m.answer("Bekor qilindi.", reply_markup=menu_kb(m.from_user.id))
 
 # =========================
-# MAIN MENU BUTTONS
+# INFO
 # =========================
 @dp.message(F.text == "💰 Balans")
 async def balance(m: types.Message):
     uid = m.from_user.id
-    await ensure_user(uid)
     real, bonus, top_ok, _, refc, _ = await get_user(uid)
     await m.answer(
         f"💰 Balans\n✅ Real: {real}\n🎁 Bonus: {bonus}\n📌 Topup: {'✅' if top_ok else '❌'}\n👥 Referal: {refc}",
@@ -410,15 +430,12 @@ async def balance(m: types.Message):
 
 @dp.message(F.text == "ℹ️ Yordam")
 async def help_(m: types.Message):
-    uid = m.from_user.id
     await m.answer(
         "ℹ️ Yordam\n"
-        "• Menyu pastda (tugmalar).\n"
-        "• Mines: 5x5, 3 bomba.\n"
-        "• Aviator: samalyot + koef (xabar edit).\n"
-        "• Promo/Kunlik/Referal → BONUS.\n"
-        "• ✅ BONUS bilan o‘ynab yutsa — yutuq REALga tushadi.\n",
-        reply_markup=menu_kb(uid)
+        "• Menyu pastda turadi.\n"
+        "• Hisob to‘ldirish: summa → HUMO/UZCARD → karta → To‘lov qildim → chek rasm → admin tasdiq.\n"
+        "• 10 daqiqada chek yuborilmasa bekor bo‘ladi.\n",
+        reply_markup=menu_kb(m.from_user.id)
     )
 
 @dp.message(F.text == "🤝 Referal")
@@ -439,6 +456,7 @@ async def daily(m: types.Message):
         h = left // 3600
         mm = (left % 3600) // 60
         return await m.answer(f"⏳ Hali tayyor emas.\nQolgan: {h} soat {mm} daqiqa", reply_markup=menu_kb(uid))
+
     await add_bonus(uid, DAILY_BONUS_AMOUNT)
     await set_last_daily(uid, now)
     await m.answer(f"✅ +{DAILY_BONUS_AMOUNT} BONUS qo‘shildi.", reply_markup=menu_kb(uid))
@@ -456,8 +474,7 @@ async def mkpromo(m: types.Message):
     code = parts[1].upper()
     if not parts[2].isdigit() or not parts[3].isdigit():
         return await m.answer("AMOUNT va MAXUSES son bo‘lsin.")
-    amount = int(parts[2])
-    maxuses = int(parts[3])
+    amount = int(parts[2]); maxuses = int(parts[3])
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -465,173 +482,423 @@ async def mkpromo(m: types.Message):
             (code, amount, maxuses, 0, int(time.time()))
         )
         await db.commit()
-
     await m.answer(f"✅ Promo yaratildi: {code} | +{amount} BONUS | max={maxuses}")
 
 @dp.message(F.text == "🎁 Promo code")
 async def promo_start(m: types.Message):
-    uid = m.from_user.id
-    steps[uid] = {"mode": "promo_enter"}
-    await m.answer("🎁 Promo kodni yozing (masalan: BONUS10)", reply_markup=cancel_kb(uid))
+    steps[m.from_user.id] = {"mode": "promo_enter"}
+    await m.answer("🎁 Promo kodni yozing:", reply_markup=cancel_kb(m.from_user.id))
 
 # =========================
-# TOPUP (so'rov)
+# TOPUP FLOW
 # =========================
 @dp.message(F.text == "➕ Hisob to‘ldirish")
 async def topup_start(m: types.Message):
     uid = m.from_user.id
-    steps[uid] = {"mode": "topup_choose"}
+    steps[uid] = {"mode": "topup_amount"}
     await m.answer(
-        f"➕ Hisob to‘ldirish (so‘rov)\nMin {MIN_TOPUP} / Max {MAX_TOPUP}\n"
-        f"⚠️ Tasdiqlansa balansga {int(TOPUP_CREDIT_RATE*100)}% tushadi.\n"
-        "Summani tanlang:",
+        f"➕ Hisob to‘ldirish\nMin {MIN_TOPUP} / Max {MAX_TOPUP}\nSummani yozing yoki tugmadan tanlang:",
         reply_markup=topup_amount_kb(uid)
     )
 
-async def create_topup_request(m: types.Message, amount: int):
+@dp.message(F.text.in_({"20 000","50 000","100 000","200 000","500 000","✍️ Boshqa summa"}))
+async def topup_buttons(m: types.Message):
     uid = m.from_user.id
+    st = steps.get(uid)
+    if not st or st.get("mode") != "topup_amount":
+        return
+
+    if m.text == "✍️ Boshqa summa":
+        steps[uid] = {"mode": "topup_amount_custom"}
+        return await m.answer("✍️ Summani son bilan yozing:", reply_markup=cancel_kb(uid))
+
+    amount = parse_int_like(m.text)
+    if amount is None:
+        return
+    steps.pop(uid, None)
+    await m.answer(f"Summa: {amount}\nQaysi karta bilan to‘laysiz?", reply_markup=kb_pay_methods(amount))
+
+@dp.callback_query(F.data.startswith("pay:method:"))
+async def pay_choose_method(q: types.CallbackQuery):
+    uid = q.from_user.id
+    _, _, _, _, _, _ = await get_user(uid)
+
+    _, _, method, amount_s = q.data.split(":")
+    amount = int(amount_s)
+
     if amount < MIN_TOPUP or amount > MAX_TOPUP:
-        return await m.answer(f"❌ Min {MIN_TOPUP} / Max {MAX_TOPUP}", reply_markup=menu_kb(uid))
+        return await q.answer("Summa noto‘g‘ri.", show_alert=True)
+
+    now = int(time.time())
+    expires_at = now + TOPUP_TIMEOUT_MIN * 60
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO topup_requests(user_id,amount,status,created_at) VALUES(?,?,?,?)",
-            (uid, amount, "pending", int(time.time()))
+            "INSERT INTO topup_requests(user_id,amount,method,receipt_file_id,status,created_at,expires_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (uid, amount, method, "", "waiting_receipt", now, expires_at)
         )
         await db.commit()
         cur = await db.execute("SELECT last_insert_rowid()")
         rid = (await cur.fetchone())[0]
 
-    await m.answer(f"✅ Topup so‘rovi yuborildi (ID #{rid}). Admin tasdiqlaydi.", reply_markup=menu_kb(uid))
+    card = PAYMENT_CARDS[method]
+    text = (
+        f"{card['title']} orqali to‘lov\n\n"
+        f"💳 Karta: {card['card']}\n"
+        f"👤 Ism: {card['name']}\n"
+        f"💰 Summa: {amount}\n\n"
+        f"⏳ {TOPUP_TIMEOUT_MIN} daqiqada chek yuborilmasa hisobga olinmaydi.\n"
+        f"To‘lov qilgan bo‘lsangiz ✅ To‘lov qildim ni bosing."
+    )
+    await q.message.edit_text(text, reply_markup=kb_paid_btn(rid))
+    await q.answer()
 
-    # adminlarga yuboramiz
+@dp.callback_query(F.data.startswith("pay:paid:"))
+async def pay_paid(q: types.CallbackQuery):
+    uid = q.from_user.id
+    rid = int(q.data.split(":")[2])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT status,expires_at FROM topup_requests WHERE id=? AND user_id=?", (rid, uid))
+        row = await cur.fetchone()
+        if not row:
+            return await q.answer("So‘rov topilmadi.", show_alert=True)
+
+        status, expires_at = row[0], int(row[1])
+        if status not in ("waiting_receipt",):
+            return await q.answer("Status noto‘g‘ri.", show_alert=True)
+
+        if int(time.time()) > expires_at:
+            await db.execute("UPDATE topup_requests SET status='expired' WHERE id=?", (rid,))
+            await db.commit()
+            return await q.answer("⏳ Vaqt tugadi.", show_alert=True)
+
+    steps[uid] = {"mode": "topup_receipt", "rid": str(rid)}
+    await q.message.edit_text("✅ Endi chekni rasm qilib yuboring (photo).", reply_markup=None)
+    await q.answer()
+
+@dp.callback_query(F.data == "pay:cancel")
+async def pay_cancel(q: types.CallbackQuery):
+    await q.answer("Bekor.")
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+@dp.message(F.photo)
+async def on_photo(m: types.Message):
+    uid = m.from_user.id
+    st = steps.get(uid)
+    if not st or st.get("mode") != "topup_receipt":
+        return
+
+    rid = int(st["rid"])
+    file_id = m.photo[-1].file_id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT amount,method,status,expires_at FROM topup_requests WHERE id=? AND user_id=?", (rid, uid))
+        row = await cur.fetchone()
+        if not row:
+            steps.pop(uid, None)
+            return await m.answer("So‘rov topilmadi.", reply_markup=menu_kb(uid))
+
+        amount, method, status, expires_at = int(row[0]), row[1], row[2], int(row[3])
+
+        if int(time.time()) > expires_at:
+            await db.execute("UPDATE topup_requests SET status='expired' WHERE id=?", (rid,))
+            await db.commit()
+            steps.pop(uid, None)
+            return await m.answer("⏳ Vaqt tugadi. Qayta urinib ko‘ring.", reply_markup=menu_kb(uid))
+
+        await db.execute(
+            "UPDATE topup_requests SET receipt_file_id=?, status='waiting_admin' WHERE id=?",
+            (file_id, rid)
+        )
+        await db.commit()
+
+    steps.pop(uid, None)
+    await m.answer("✅ Chek yuborildi. Admin tekshiradi.", reply_markup=menu_kb(uid))
+
+    card = PAYMENT_CARDS.get(method, {"title": method})
     for a in ADMIN_IDS:
         try:
-            await m.bot.send_message(
+            await m.bot.send_photo(
                 a,
-                f"📥 TOPUP REQUEST\nID #{rid}\nUser: {uid}\nAmount: {amount}",
-                reply_markup=kb_admin_req("top", rid)
+                photo=file_id,
+                caption=(
+                    f"📥 TOPUP\n"
+                    f"ID #{rid}\n"
+                    f"User: {uid}\n"
+                    f"Method: {card['title']}\n"
+                    f"Amount: {amount}\n\n"
+                    f"Tasdiqlaysizmi?"
+                ),
+                reply_markup=kb_admin_topup(rid)
             )
         except:
             pass
 
+@dp.callback_query(F.data.startswith("top:ok:"))
+async def admin_top_ok(q: types.CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return await q.answer("Yo‘q.", show_alert=True)
+
+    rid = int(q.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id,amount,status FROM topup_requests WHERE id=?", (rid,))
+        row = await cur.fetchone()
+        if not row or row[2] != "waiting_admin":
+            return await q.answer("Status noto‘g‘ri.", show_alert=True)
+
+        uid, amount = int(row[0]), int(row[1])
+
+        await db.execute("UPDATE topup_requests SET status='approved', handled_by=?, handled_at=? WHERE id=?",
+                         (q.from_user.id, int(time.time()), rid))
+        await db.execute("UPDATE users SET real_balance=real_balance+?, topup_verified=1 WHERE user_id=?", (amount, uid))
+        await db.commit()
+
+    try:
+        await q.bot.send_message(uid, f"✅ To‘lov tasdiqlandi! +{amount} REAL", reply_markup=menu_kb(uid))
+    except:
+        pass
+
+    await q.answer("OK")
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+@dp.callback_query(F.data.startswith("top:no:"))
+async def admin_top_no(q: types.CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return await q.answer("Yo‘q.", show_alert=True)
+
+    rid = int(q.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id,amount,status FROM topup_requests WHERE id=?", (rid,))
+        row = await cur.fetchone()
+        if not row or row[2] != "waiting_admin":
+            return await q.answer("Status noto‘g‘ri.", show_alert=True)
+        uid, amount = int(row[0]), int(row[1])
+
+        await db.execute("UPDATE topup_requests SET status='rejected', handled_by=?, handled_at=? WHERE id=?",
+                         (q.from_user.id, int(time.time()), rid))
+        await db.commit()
+
+    try:
+        await q.bot.send_message(uid, f"❌ To‘lov rad qilindi. (Summa: {amount})", reply_markup=menu_kb(uid))
+    except:
+        pass
+
+    await q.answer("Rejected")
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
 # =========================
-# WITHDRAW (so'rov)
+# WITHDRAW FLOW
 # =========================
 @dp.message(F.text == "📤 Pul yechish")
 async def withdraw_start(m: types.Message):
     uid = m.from_user.id
     real, _, top_ok, *_ = await get_user(uid)
     if not top_ok:
-        return await m.answer("❌ Pul yechish uchun avval TOPUP tasdiqlangan bo‘lsin.", reply_markup=menu_kb(uid))
+        return await m.answer("❌ Pul yechish uchun avval TOPUP tasdiqlangan bo‘lishi kerak.", reply_markup=menu_kb(uid))
     if real <= 0:
         return await m.answer("❌ REAL balans 0.", reply_markup=menu_kb(uid))
 
     steps[uid] = {"mode": "wd_amount"}
     await m.answer("📤 Pul yechish\nSummani yozing (son):", reply_markup=cancel_kb(uid))
 
+@dp.callback_query(F.data.startswith("wd:method:"))
+async def wd_method(q: types.CallbackQuery):
+    uid = q.from_user.id
+    _, _, method, amount_s = q.data.split(":")
+    amount = int(amount_s)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO withdraw_requests(user_id,amount,method,card_number,status,created_at) VALUES(?,?,?,?,?,?)",
+            (uid, amount, method, "", "pending", int(time.time()))
+        )
+        await db.commit()
+        cur = await db.execute("SELECT last_insert_rowid()")
+        rid = (await cur.fetchone())[0]
+
+    steps[uid] = {"mode": "wd_card", "rid": str(rid)}
+    await q.message.edit_text("💳 Karta raqamingizni yozing (faqat raqam):", reply_markup=None)
+    await q.answer()
+
+@dp.callback_query(F.data == "wd:cancel")
+async def wd_cancel(q: types.CallbackQuery):
+    await q.answer("Bekor.")
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+@dp.callback_query(F.data.startswith("wda:ok:"))
+async def admin_wd_ok(q: types.CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return await q.answer("Yo‘q.", show_alert=True)
+    rid = int(q.data.split(":")[2])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id,amount,status FROM withdraw_requests WHERE id=?", (rid,))
+        row = await cur.fetchone()
+        if not row or row[2] != "pending":
+            return await q.answer("Status noto‘g‘ri.", show_alert=True)
+
+        uid, amount = int(row[0]), int(row[1])
+
+        await db.execute("UPDATE withdraw_requests SET status='approved', handled_by=?, handled_at=? WHERE id=?",
+                         (q.from_user.id, int(time.time()), rid))
+        await db.commit()
+
+    try:
+        await q.bot.send_message(uid, f"✅ Withdraw tasdiqlandi! (Summa: {amount})", reply_markup=menu_kb(uid))
+    except:
+        pass
+
+    await q.answer("OK")
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+@dp.callback_query(F.data.startswith("wda:no:"))
+async def admin_wd_no(q: types.CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return await q.answer("Yo‘q.", show_alert=True)
+    rid = int(q.data.split(":")[2])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id,amount,status FROM withdraw_requests WHERE id=?", (rid,))
+        row = await cur.fetchone()
+        if not row or row[2] != "pending":
+            return await q.answer("Status noto‘g‘ri.", show_alert=True)
+        uid, amount = int(row[0]), int(row[1])
+
+        # rad bo'lsa pulni qaytaramiz
+        await db.execute("UPDATE withdraw_requests SET status='rejected', handled_by=?, handled_at=? WHERE id=?",
+                         (q.from_user.id, int(time.time()), rid))
+        await db.execute("UPDATE users SET real_balance=real_balance+? WHERE user_id=?", (amount, uid))
+        await db.commit()
+
+    try:
+        await q.bot.send_message(uid, f"❌ Withdraw rad qilindi. Pul qaytarildi: {amount}", reply_markup=menu_kb(uid))
+    except:
+        pass
+
+    await q.answer("Rejected")
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
 # =========================
-# GAMES START (stavka tanlash)
+# ADMIN PANEL
+# =========================
+@dp.message(F.text == "🛠 Admin panel")
+async def admin_panel(m: types.Message):
+    if not is_admin(m.from_user.id):
+        return
+    await m.answer("🛠 Admin panel", reply_markup=admin_panel_kb(m.from_user.id))
+
+@dp.message(F.text == "📥 Topup pending")
+async def admin_top_list(m: types.Message):
+    if not is_admin(m.from_user.id):
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id,user_id,amount,method,status FROM topup_requests WHERE status='waiting_admin' ORDER BY id DESC LIMIT 10"
+        )
+        rows = await cur.fetchall()
+    if not rows:
+        return await m.answer("Pending topup yo‘q.", reply_markup=admin_panel_kb(m.from_user.id))
+    for rid, uid, amount, method, status in rows:
+        await m.answer(f"📥 TOPUP #{rid}\nUser: {uid}\nAmount: {amount}\nMethod: {method}\nStatus: {status}")
+
+@dp.message(F.text == "📤 Withdraw pending")
+async def admin_wd_list(m: types.Message):
+    if not is_admin(m.from_user.id):
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id,user_id,amount,method,card_number,status FROM withdraw_requests WHERE status='pending' ORDER BY id DESC LIMIT 10"
+        )
+        rows = await cur.fetchall()
+    if not rows:
+        return await m.answer("Pending withdraw yo‘q.", reply_markup=admin_panel_kb(m.from_user.id))
+    for rid, uid, amount, method, card, status in rows:
+        await m.answer(
+            f"📤 WITHDRAW #{rid}\nUser: {uid}\nAmount: {amount}\nMethod: {method}\nCard: {card}\nStatus: {status}",
+            reply_markup=kb_admin_withdraw(rid)
+        )
+
+# =========================
+# GAMES START
 # =========================
 @dp.message(F.text == "💣 Mines")
 async def mines_start(m: types.Message):
-    uid = m.from_user.id
-    steps[uid] = {"mode": "mn_bet"}
-    await m.answer("💣 Mines\nStavkani tanlang:", reply_markup=bet_kb(uid))
+    steps[m.from_user.id] = {"mode": "mn_bet"}
+    await m.answer("💣 Mines\nStavkani tanlang:", reply_markup=bet_kb(m.from_user.id))
 
 @dp.message(F.text == "✈️ Aviator")
 async def aviator_start(m: types.Message):
-    uid = m.from_user.id
-    steps[uid] = {"mode": "av_bet"}
-    await m.answer("✈️ Aviator\nStavkani tanlang:", reply_markup=bet_kb(uid))
+    steps[m.from_user.id] = {"mode": "av_bet"}
+    await m.answer("✈️ Aviator\nStavkani tanlang:", reply_markup=bet_kb(m.from_user.id))
 
-# =========================
-# ✅ STAVKA TUGMALARI (BU JOY ENG MUHIM!)
-# text_routerdan OLDIN turishi shart — shunda ishlaydi.
-# =========================
-@dp.message(F.text.in_({"1 000", "2 000", "5 000", "10 000", "20 000", "✍️ Boshqa stavka"}))
+@dp.message(F.text.in_({"1 000","2 000","5 000","10 000","20 000","✍️ Boshqa stavka"}))
 async def bet_buttons(m: types.Message):
     uid = m.from_user.id
     st = steps.get(uid)
-    if not st or st.get("mode") not in ("mn_bet", "av_bet"):
+    if not st or st.get("mode") not in ("mn_bet","av_bet"):
         return
-
     if m.text == "✍️ Boshqa stavka":
         steps[uid] = {"mode": "mn_bet_custom"} if st["mode"] == "mn_bet" else {"mode": "av_bet_custom"}
         return await m.answer("✍️ Stavkani son bilan yozing:", reply_markup=cancel_kb(uid))
 
     bet = parse_int_like(m.text)
-    if bet is None:
-        return
-
     mode = st["mode"]
     steps.pop(uid, None)
     if mode == "mn_bet":
         return await start_mines_game(m, bet)
-    else:
-        return await start_aviator_game(m, bet)
+    return await start_aviator_game(m, bet)
 
-@dp.message(F.text.in_({"20 000", "50 000", "100 000", "200 000", "500 000", "✍️ Boshqa summa"}))
-async def topup_buttons(m: types.Message):
-    uid = m.from_user.id
-    st = steps.get(uid)
-    if not st or st.get("mode") != "topup_choose":
-        return
-
-    if m.text == "✍️ Boshqa summa":
-        steps[uid] = {"mode": "topup_custom"}
-        return await m.answer("✍️ Summani son bilan yozing:", reply_markup=cancel_kb(uid))
-
-    amount = parse_int_like(m.text)
-    if amount is None:
-        return
-
-    steps.pop(uid, None)
-    return await create_topup_request(m, amount)
-
-# =========================
-# MINES GAME START
-# =========================
 async def start_mines_game(m: types.Message, bet: int):
     uid = m.from_user.id
     real, bonus, *_ = await get_user(uid)
-
     wallet = "real" if real >= bet else ("bonus" if bonus >= bet else "")
-    if wallet == "":
-        return await m.answer("❌ Balans yetarli emas (REAL yoki BONUS).", reply_markup=menu_kb(uid))
+    if not wallet:
+        return await m.answer("❌ Balans yetarli emas.", reply_markup=menu_kb(uid))
 
     ok = await (take_real(uid, bet) if wallet == "real" else take_bonus(uid, bet))
     if not ok:
         return await m.answer("❌ Balans yetarli emas.", reply_markup=menu_kb(uid))
 
     mines_sessions[uid] = MinesSession(bet=bet, wallet=wallet, bombs=set(), opened=set(), active=True)
-    await m.answer(f"💣 Mines boshlandi!\nBet: {bet} ({wallet.upper()})", reply_markup=menu_kb(uid))
-    await m.answer("⬇️ O‘yin paneli:", reply_markup=kb_mines_grid(set()))
+    await m.answer(f"💣 Mines boshlandi! Bet: {bet} ({wallet.upper()})", reply_markup=menu_kb(uid))
+    await m.answer("⬇️ O‘yin:", reply_markup=kb_mines_grid(set()))
 
-# =========================
-# AVIATOR GAME START
-# =========================
 async def start_aviator_game(m: types.Message, bet: int):
     uid = m.from_user.id
     real, bonus, *_ = await get_user(uid)
-
     wallet = "real" if real >= bet else ("bonus" if bonus >= bet else "")
-    if wallet == "":
-        return await m.answer("❌ Balans yetarli emas (REAL yoki BONUS).", reply_markup=menu_kb(uid))
+    if not wallet:
+        return await m.answer("❌ Balans yetarli emas.", reply_markup=menu_kb(uid))
 
     ok = await (take_real(uid, bet) if wallet == "real" else take_bonus(uid, bet))
     if not ok:
         return await m.answer("❌ Balans yetarli emas.", reply_markup=menu_kb(uid))
 
     sent = await m.answer(render_plane(1.00, 0, bet, wallet), reply_markup=kb_aviator_inline())
-    aviator_sessions[uid] = AviatorSession(bet=bet, wallet=wallet, mult=1.0, msg_id=sent.message_id, frame=0)
+    aviator_sessions[uid] = AviatorSession(bet=bet, wallet=wallet, msg_id=sent.message_id)
     asyncio.create_task(aviator_loop(m.bot, uid))
+    await m.answer("✈️ Aviator boshlandi!", reply_markup=menu_kb(uid))
 
-    await m.answer("✈️ Aviator boshlandi! Cashout bosib olasiz.", reply_markup=menu_kb(uid))
-
-# =========================
-# INLINE CALLBACKS: MINES
-# =========================
 @dp.callback_query(F.data.startswith("mn:pick:"))
 async def mn_pick(q: types.CallbackQuery):
     uid = q.from_user.id
@@ -649,20 +916,14 @@ async def mn_pick(q: types.CallbackQuery):
     if idx in s.bombs:
         s.active = False
         mines_sessions[uid] = s
-        try:
-            await q.message.edit_text("💥 Bomb!\n😅 Keyingi safar omad!", reply_markup=kb_mines_grid(s.opened, bombs=s.bombs))
-        except:
-            pass
+        await q.message.edit_text("💥 Bomb!\n😅 Keyingi safar omad!", reply_markup=kb_mines_grid(s.opened, bombs=s.bombs))
         return await q.answer()
 
     s.opened.add(idx)
     mines_sessions[uid] = s
     opened = len(s.opened)
     mult = mines_multiplier(opened)
-    try:
-        await q.message.edit_text(f"💣 Mines\nOchilgan: {opened}\nKoef: x{mult:.2f}", reply_markup=kb_mines_grid(s.opened))
-    except:
-        pass
+    await q.message.edit_text(f"💣 Mines\nOchilgan: {opened}\nKoef: x{mult:.2f}", reply_markup=kb_mines_grid(s.opened))
     await q.answer()
 
 @dp.callback_query(F.data == "mn:cashout")
@@ -681,27 +942,18 @@ async def mn_cashout(q: types.CallbackQuery):
     mult = mines_multiplier(opened)
     win = int(round(s.bet * mult))
 
-    # ✅ SEN AYTGANDAY: bonusdan o'ynasa ham yutuq REALga tushadi
+    # BONUS bilan o'ynasa ham yutuq REALga o'tadi (sen so'ragan)
     await add_real(uid, win)
 
-    try:
-        await q.message.edit_text(f"✅ Cashout!\nKoef: x{mult:.2f}\nYutuq: {win} → REALga tushdi.", reply_markup=None)
-    except:
-        pass
+    await q.message.edit_text(f"✅ Cashout!\nKoef: x{mult:.2f}\nYutuq: {win} → REAL", reply_markup=None)
     await q.answer()
 
 @dp.callback_query(F.data == "mn:stop")
 async def mn_stop(q: types.CallbackQuery):
     mines_sessions.pop(q.from_user.id, None)
-    try:
-        await q.message.edit_text("❌ Mines to‘xtatildi.", reply_markup=None)
-    except:
-        pass
+    await q.message.edit_text("❌ Mines to‘xtatildi.", reply_markup=None)
     await q.answer()
 
-# =========================
-# INLINE CALLBACKS: AVIATOR
-# =========================
 @dp.callback_query(F.data == "av:cashout")
 async def av_cashout(q: types.CallbackQuery):
     uid = q.from_user.id
@@ -713,19 +965,14 @@ async def av_cashout(q: types.CallbackQuery):
     aviator_sessions[uid] = s
     win = int(round(s.bet * s.mult))
 
-    # ✅ bonusdan o'ynasa ham yutuq REALga tushadi
     await add_real(uid, win)
 
-    try:
-        await q.bot.edit_message_text(
-            chat_id=uid,
-            message_id=s.msg_id,
-            text=render_plane(s.mult, s.frame, s.bet, s.wallet) + f"\n\n✅ CASHOUT!\nYutuq: {win} → REALga tushdi.",
-            reply_markup=None
-        )
-    except:
-        pass
-
+    await q.bot.edit_message_text(
+        chat_id=uid,
+        message_id=s.msg_id,
+        text=render_plane(s.mult, s.frame, s.bet, s.wallet) + f"\n\n✅ CASHOUT!\nYutuq: {win} → REAL",
+        reply_markup=None
+    )
     await q.answer("Cashout!")
 
 @dp.callback_query(F.data == "av:stop")
@@ -738,181 +985,7 @@ async def av_stop(q: types.CallbackQuery):
     await q.answer("Stop")
 
 # =========================
-# ADMIN PANEL (reply)
-# =========================
-@dp.message(F.text == "🛠 Admin panel")
-async def admin_panel(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return
-    await m.answer("🛠 Admin panel", reply_markup=admin_panel_kb(m.from_user.id))
-
-@dp.message(F.text == "📊 Profit")
-async def admin_profit(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT profit FROM house_profit WHERE id=1")
-        profit = (await cur.fetchone())[0]
-    await m.answer(f"📊 House profit: {profit}", reply_markup=admin_panel_kb(m.from_user.id))
-
-@dp.message(F.text == "📥 Topup pending")
-async def admin_top_list(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id,user_id,amount FROM topup_requests WHERE status='pending' ORDER BY id DESC LIMIT 10")
-        rows = await cur.fetchall()
-    if not rows:
-        return await m.answer("📥 Pending topup yo‘q.", reply_markup=admin_panel_kb(m.from_user.id))
-
-    for rid, uid, amount in rows:
-        await m.answer(
-            f"📥 TOPUP\nID #{rid}\nUser: {uid}\nAmount: {amount}",
-            reply_markup=kb_admin_req("top", rid)
-        )
-
-@dp.message(F.text == "📤 Withdraw pending")
-async def admin_wd_list(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id,user_id,amount,note FROM withdraw_requests WHERE status='pending' ORDER BY id DESC LIMIT 10")
-        rows = await cur.fetchall()
-    if not rows:
-        return await m.answer("📤 Pending withdraw yo‘q.", reply_markup=admin_panel_kb(m.from_user.id))
-
-    for rid, uid, amount, note in rows:
-        await m.answer(
-            f"📤 WITHDRAW\nID #{rid}\nUser: {uid}\nAmount: {amount}\nNote: {note}",
-            reply_markup=kb_admin_req("wd", rid)
-        )
-
-# =========================
-# ADMIN INLINE approve/reject
-# =========================
-@dp.callback_query(F.data.startswith("top:ok:"))
-async def top_ok(q: types.CallbackQuery):
-    if not is_admin(q.from_user.id):
-        return await q.answer("No.", show_alert=True)
-    rid = int(q.data.split(":")[2])
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id,amount,status FROM topup_requests WHERE id=?", (rid,))
-        row = await cur.fetchone()
-        if not row or row[2] != "pending":
-            return await q.answer("Pending emas.", show_alert=True)
-
-        uid, amount = int(row[0]), int(row[1])
-        credited = int(round(amount * TOPUP_CREDIT_RATE))
-        fee = amount - credited
-
-        await db.execute("UPDATE topup_requests SET status='approved', handled_by=?, handled_at=? WHERE id=?",
-                         (q.from_user.id, int(time.time()), rid))
-        await db.execute("UPDATE users SET real_balance=real_balance+?, topup_verified=1 WHERE user_id=?",
-                         (credited, uid))
-        await db.execute("UPDATE house_profit SET profit=profit+? WHERE id=1", (fee,))
-        await db.commit()
-
-    try:
-        await q.bot.send_message(uid, f"✅ Topup tasdiqlandi!\nSo‘rov: {amount}\nBalansga: {credited}\nFee: {fee}", reply_markup=menu_kb(uid))
-    except:
-        pass
-
-    await q.answer("OK")
-    try:
-        await q.message.edit_reply_markup(reply_markup=None)
-    except:
-        pass
-
-@dp.callback_query(F.data.startswith("top:no:"))
-async def top_no(q: types.CallbackQuery):
-    if not is_admin(q.from_user.id):
-        return await q.answer("No.", show_alert=True)
-    rid = int(q.data.split(":")[2])
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id,amount,status FROM topup_requests WHERE id=?", (rid,))
-        row = await cur.fetchone()
-        if not row or row[2] != "pending":
-            return await q.answer("Pending emas.", show_alert=True)
-        uid, amount = int(row[0]), int(row[1])
-
-        await db.execute("UPDATE topup_requests SET status='rejected', handled_by=?, handled_at=? WHERE id=?",
-                         (q.from_user.id, int(time.time()), rid))
-        await db.commit()
-
-    try:
-        await q.bot.send_message(uid, f"❌ Topup rad.\nSo‘rov: {amount}", reply_markup=menu_kb(uid))
-    except:
-        pass
-
-    await q.answer("Rejected")
-    try:
-        await q.message.edit_reply_markup(reply_markup=None)
-    except:
-        pass
-
-@dp.callback_query(F.data.startswith("wd:ok:"))
-async def wd_ok(q: types.CallbackQuery):
-    if not is_admin(q.from_user.id):
-        return await q.answer("No.", show_alert=True)
-    rid = int(q.data.split(":")[2])
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id,amount,status FROM withdraw_requests WHERE id=?", (rid,))
-        row = await cur.fetchone()
-        if not row or row[2] != "pending":
-            return await q.answer("Pending emas.", show_alert=True)
-        uid, amount = int(row[0]), int(row[1])
-
-        await db.execute("UPDATE withdraw_requests SET status='approved', handled_by=?, handled_at=? WHERE id=?",
-                         (q.from_user.id, int(time.time()), rid))
-        await db.commit()
-
-    try:
-        await q.bot.send_message(uid, f"✅ Withdraw tasdiqlandi!\nSumma: {amount}", reply_markup=menu_kb(uid))
-    except:
-        pass
-
-    await q.answer("OK")
-    try:
-        await q.message.edit_reply_markup(reply_markup=None)
-    except:
-        pass
-
-@dp.callback_query(F.data.startswith("wd:no:"))
-async def wd_no(q: types.CallbackQuery):
-    if not is_admin(q.from_user.id):
-        return await q.answer("No.", show_alert=True)
-    rid = int(q.data.split(":")[2])
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id,amount,status FROM withdraw_requests WHERE id=?", (rid,))
-        row = await cur.fetchone()
-        if not row or row[2] != "pending":
-            return await q.answer("Pending emas.", show_alert=True)
-        uid, amount = int(row[0]), int(row[1])
-
-        await db.execute("UPDATE withdraw_requests SET status='rejected', handled_by=?, handled_at=? WHERE id=?",
-                         (q.from_user.id, int(time.time()), rid))
-        # pulni qaytaramiz (reserve bo'lsa)
-        await db.execute("UPDATE users SET real_balance=real_balance+? WHERE user_id=?", (amount, uid))
-        await db.commit()
-
-    try:
-        await q.bot.send_message(uid, f"❌ Withdraw rad.\nPul qaytarildi: {amount}", reply_markup=menu_kb(uid))
-    except:
-        pass
-
-    await q.answer("Rejected")
-    try:
-        await q.message.edit_reply_markup(reply_markup=None)
-    except:
-        pass
-
-# =========================
-# ✅ TEXT ROUTER (ENG OXIRIDA!)
-# Bu handler oxirida tursa — stavka tugmalari ishlaydi.
+# TEXT ROUTER (ENG OXIRIDA)
 # =========================
 @dp.message(F.text)
 async def text_router(m: types.Message):
@@ -925,30 +998,10 @@ async def text_router(m: types.Message):
     txt = (m.text or "").strip()
     mode = st.get("mode")
 
-    # Custom stavka (mines/aviator)
-    if mode in ("mn_bet_custom", "av_bet_custom"):
-        bet = parse_int_like(txt)
-        if bet is None or bet <= 0:
-            return await m.answer("❌ Stavkani son bilan yozing (masalan 5000).", reply_markup=cancel_kb(uid))
-        steps.pop(uid, None)
-        if mode == "mn_bet_custom":
-            return await start_mines_game(m, bet)
-        else:
-            return await start_aviator_game(m, bet)
-
-    # Custom topup
-    if mode == "topup_custom":
-        amount = parse_int_like(txt)
-        if amount is None:
-            return await m.answer("❌ Summani son bilan yozing.", reply_markup=cancel_kb(uid))
-        steps.pop(uid, None)
-        return await create_topup_request(m, amount)
-
-    # Promo enter
+    # promo
     if mode == "promo_enter":
         code = txt.upper()
         now = int(time.time())
-
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute("SELECT 1 FROM promo_uses WHERE user_id=? AND code=?", (uid, code))
             if await cur.fetchone():
@@ -972,14 +1025,31 @@ async def text_router(m: types.Message):
             await db.commit()
 
         steps.pop(uid, None)
-        return await m.answer(f"✅ Promo qabul qilindi: +{amount} BONUS", reply_markup=menu_kb(uid))
+        return await m.answer(f"✅ Promo: +{amount} BONUS", reply_markup=menu_kb(uid))
 
-    # Withdraw flow
+    # topup custom amount
+    if mode == "topup_amount_custom":
+        amount = parse_int_like(txt)
+        if amount is None:
+            return await m.answer("❌ Summani son bilan yozing.", reply_markup=cancel_kb(uid))
+        steps.pop(uid, None)
+        return await m.answer(f"Summa: {amount}\nQaysi karta bilan to‘laysiz?", reply_markup=kb_pay_methods(amount))
+
+    # mines/aviator custom bet
+    if mode in ("mn_bet_custom","av_bet_custom"):
+        bet = parse_int_like(txt)
+        if bet is None or bet <= 0:
+            return await m.answer("❌ Stavkani son bilan yozing.", reply_markup=cancel_kb(uid))
+        steps.pop(uid, None)
+        if mode == "mn_bet_custom":
+            return await start_mines_game(m, bet)
+        return await start_aviator_game(m, bet)
+
+    # withdraw flow: amount
     if mode == "wd_amount":
         amount = parse_int_like(txt)
         if amount is None or amount <= 0:
             return await m.answer("❌ Summani son bilan yozing.", reply_markup=cancel_kb(uid))
-
         real, _, top_ok, *_ = await get_user(uid)
         if not top_ok:
             steps.pop(uid, None)
@@ -992,30 +1062,39 @@ async def text_router(m: types.Message):
             steps.pop(uid, None)
             return await m.answer("❌ REAL yetarli emas.", reply_markup=menu_kb(uid))
 
-        steps[uid] = {"mode": "wd_note", "amount": str(amount)}
-        return await m.answer("📝 Qayerga yechilsin? (izoh yozing)", reply_markup=cancel_kb(uid))
+        steps[uid] = {"mode": "wd_choose_method", "amount": str(amount)}
+        return await m.answer("Qaysi karta turiga yechiladi?", reply_markup=menu_kb(uid)) or \
+               await m.answer("⬇️ Tanlang:", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                   [
+                       types.InlineKeyboardButton(text="🟦 HUMO", callback_data=f"wd:method:humo:{amount}"),
+                       types.InlineKeyboardButton(text="🟩 UZCARD", callback_data=f"wd:method:uzcard:{amount}")
+                   ],
+                   [types.InlineKeyboardButton(text="❌ Bekor", callback_data="wd:cancel")]
+               ]))
 
-    if mode == "wd_note":
-        amount = int(st["amount"])
-        note = txt[:120]
-        steps.pop(uid, None)
+    # withdraw flow: card number
+    if mode == "wd_card":
+        rid = int(st["rid"])
+        card = txt.replace(" ", "")
+        if not card.isdigit() or len(card) < 12:
+            return await m.answer("❌ Karta raqam noto‘g‘ri. Qayta yozing (faqat raqam).", reply_markup=cancel_kb(uid))
 
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO withdraw_requests(user_id,amount,note,status,created_at) VALUES(?,?,?,?,?)",
-                (uid, amount, note, "pending", int(time.time()))
-            )
+            await db.execute("UPDATE withdraw_requests SET card_number=? WHERE id=? AND user_id=?", (card, rid, uid))
+            cur = await db.execute("SELECT amount,method,status FROM withdraw_requests WHERE id=?", (rid,))
+            row = await cur.fetchone()
             await db.commit()
-            cur = await db.execute("SELECT last_insert_rowid()")
-            rid = (await cur.fetchone())[0]
 
-        await m.answer(f"✅ Withdraw so‘rovi yuborildi (ID #{rid}). Admin ko‘rib chiqadi.", reply_markup=menu_kb(uid))
+        steps.pop(uid, None)
+        await m.answer("✅ So‘rov yuborildi. Admin ko‘rib chiqadi.", reply_markup=menu_kb(uid))
+
+        amount, method, status = int(row[0]), row[1], row[2]
         for a in ADMIN_IDS:
             try:
                 await m.bot.send_message(
                     a,
-                    f"📤 WITHDRAW REQUEST\nID #{rid}\nUser: {uid}\nAmount: {amount}\nNote: {note}",
-                    reply_markup=kb_admin_req("wd", rid)
+                    f"📤 WITHDRAW\nID #{rid}\nUser: {uid}\nAmount: {amount}\nMethod: {method}\nCard: {card}",
+                    reply_markup=kb_admin_withdraw(rid)
                 )
             except:
                 pass
