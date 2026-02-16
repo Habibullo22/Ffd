@@ -18,8 +18,8 @@ DB_PATH = "bot.db"
 
 # Kartalar (ko'rsatish uchun)
 PAYMENT_CARDS = {
-    "humo":   {"title": "🟦 HUMO",   "card": "9860 XXXX XXXX XXXX", "name": "H. (Ism)"},
-    "uzcard": {"title": "🟩 UZCARD", "card": "8600 XXXX XXXX XXXX", "name": "H. (Ism)"},
+    "humo":   {"title": "🟦 HUMO",   "card": "9860 6067 5024 7151", "name": "H. (Ism)"},
+    "uzcard": {"title": "🟩 UZCARD", "card": "9860 6067 5024 7151", "name": "H. (Ism)"},
 }
 
 MIN_TOPUP = 20000
